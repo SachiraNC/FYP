@@ -1,0 +1,7 @@
+# CIS benchmark PDF/markdown - licence forbids redistribution
+*.pdf
+CIS_*.md
+
+# Generated audit reports (contain host data)
+*.html
+*.json
