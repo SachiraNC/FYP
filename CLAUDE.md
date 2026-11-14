@@ -1,33 +1,98 @@
-# CLAUDE.md — CIS Benchmark Compliance Tool with Governance Mapping
+# CLAUDE.md — Multi-host CIS Compliance Platform for Ubuntu 24.04
 
 Final Year Project, BSc (Hons) Cyber Security — APIIT / Staffordshire University.
 
 ## Project aim
 
-Build an automated CIS Benchmark compliance tool for **Ubuntu 24.04 LTS** that goes beyond
-pass/fail scanning: every control result carries verifiable evidence, results persist as
-machine-readable data, changes between runs are tracked, findings are mapped to governance
-frameworks, accepted risks are handled as formal exceptions, and the final output is
-auditor-ready.
+Build a **multi-host CIS Benchmark compliance platform for Ubuntu 24.04 LTS**.
 
-## Architecture (pipeline)
+- **Core features:**
+  - Scan many hosts over SSH.
+  - Show results on a dashboard.
+  - Apply **selective, safe remediation**.
+- **Requirements behind every result:**
+  - Each control result carries verifiable evidence.
+  - Results persist as machine-readable data, and changes between runs are tracked.
+  - Accepted risks are handled as formal exceptions.
+  - Output is auditor-ready.
+
+**Novelty (what the project claims beyond existing scanners):**
+
+1. **Safe, verified remediation.** Fixes are opt-in and applied per control. Each fix is checked
+   before it runs, and the control is re-audited afterwards to prove the change worked.
+2. **Confidence-graded governance mapping.** Each CIS control is mapped to governance frameworks
+   (CIS Controls v8, ISO/IEC 27001:2022, NIST CSF 2.0, …), and every mapping carries an explicit
+   confidence grade rather than a flat "maps to".
+3. **Tamper-evident compliance history.** Stored results and history can be shown to be unaltered.
+
+**No AI features.** No LLMs, ML models, or "AI-assisted" anything, in any component.
+
+## Architecture
 
 ```
-cis_ubuntu_24.04_lts_v2.0.0_audit.sh   (Bash + embedded Python 3 stdlib, runs as root on target)
-        │  writes  <name>.html  (human report, unchanged format)
-        │  writes  <name>.json  (results.json — the canonical data contract)
+┌──────────────────────── backend/ (FastAPI + SQLite) ─────────────────────────┐
+│ admin login + sessions · append-only audit log · host inventory              │
+│ credential vault (Fernet) · SSH connector (paramiko, host-key pinning)       │
+│        │ push audit script over SSH, run as root (sudo), fetch results.json  │
+│        ▼                                                                     │
+│ [planned] scan orchestration → results store (tamper-evident history)        │
+│           → delta engine → governance mapper (confidence-graded)            │
+│           → exception handler → safe remediation → governance report        │
+└──────────────────────────────────────────────────────────────────────────────┘
+        │ SSH (scp/sftp + exec)
         ▼
-governance mapper      results.json  →  control ↔ framework mappings (CIS Controls v8, ISO 27001, NIST CSF …)
-        ▼
-delta engine           two or more results.json  →  new / fixed / regressed / unchanged controls
-        ▼
-exception handler      approved risk acceptances (owner, justification, expiry) applied to findings
-        ▼
-governance report      auditor-ready output (HTML/PDF, OSCAL JSON)
+target hosts (Ubuntu 24.04): cis_ubuntu_24.04_lts_v2.0.0_audit.sh
+        writes <name>.html (human report, unchanged format) and <name>.json (results.json)
 ```
 
-Only the audit script exists so far. Downstream components consume `results.json`; they must
-never parse the HTML.
+**What exists now:**
+
+- the audit script;
+- the `backend/` foundation: inventory, vault, SSH connector, auth, and audit log.
+
+Scan orchestration, dashboard, delta engine, governance mapping, exceptions and remediation are
+**not built yet**. Downstream components consume `results.json`; they must never parse the HTML.
+
+## Backend (`backend/`)
+
+- **Stack:** FastAPI, SQLite (stdlib `sqlite3`, no ORM), `cryptography` (Fernet) and `paramiko`.
+  Tests use `pytest` and `httpx`. These are the approved dependencies, pinned in
+  `backend/requirements*.txt`; adding anything else needs explicit approval.
+- **Run and test:** see `backend/README.md`. Run `python -m pytest` from `backend/` after every
+  change. The SSH tests use an in-process fake server (`tests/fake_ssh.py`).
+- **Layout:**
+  - `app/config.py`: env settings.
+  - `app/db.py`: schema and triggers.
+  - `app/security.py`: scrypt and session tokens.
+  - `app/vault.py`: the credential vault.
+  - `app/ssh.py`: the connector.
+  - `app/audit.py`: the audit log.
+  - `app/inventory.py`: host helpers.
+  - `app/routers/`: the HTTP API.
+  - `app/cli.py`: `generate-key` and `create-admin`.
+- **Security invariants (tests enforce these, so keep them):**
+  - **Secrets:**
+    - Stored only Fernet-encrypted. The master key comes from `CISPLAT_MASTER_KEY` and nowhere
+      else; the app refuses to start without it.
+    - Never returned by the API or logged, never written to the audit log (`audit.record` rejects
+      secret-named fields), and never echoed in 422 responses (custom validation handler).
+    - Secret inputs are `SecretStr`, and `Credentials` fields are `repr=False`.
+  - **SSH keys:** prefer key authentication. Password auth is allowed but always carries a
+    warning.
+  - **Host keys:** trusted on first use, then pinned.
+    - A changed key, or a key of a different type, is refused before authentication. The API
+      returns 409 and the event is audited.
+    - Re-pinning only happens when the admin supplies the verified fingerprint.
+  - **Authorised use:** adding a host requires `authorised_use_confirmed: true`, recorded with who,
+    when and the statement text. Changing a host's address or port requires confirming it again.
+  - **Audit log:** every state-changing action, login, and SSH connection or host-key event is
+    written to `audit_log`. The table is append-only (UPDATE and DELETE are blocked by triggers).
+  - **Admin passwords:** scrypt hashes. Only the SHA-256 of each session token is stored.
+  - **SSH defaults:** never use the backend machine's SSH agent or `~/.ssh` keys.
+  - **sudo password mode:** uses `sudo -k -S`, so the password can never reach the command's stdin.
+- **Scope discipline:** only build what is asked. Do not add endpoints for arbitrary remote
+  command execution. The connector's `run`, `upload` and `download` are for internal use by future
+  scan and remediation code.
 
 ### results.json contract (produced by the audit script, `--json FILE`)
 
@@ -50,10 +115,13 @@ never parse the HTML.
 
 ## Hard rules
 
-1. **The audit script stays zero-dependency.** Bash + coreutils/standard Ubuntu tools +
-   **Python 3 standard library only**. No `pip install`, no third-party modules, no network
-   calls. Downstream components should also prefer stdlib; any new dependency needs explicit
-   approval.
+1. **The audit script stays zero-dependency.** It may use Bash, coreutils and standard Ubuntu
+   tools, plus the **Python 3 standard library only**: no `pip install`, no third-party modules,
+   no network calls.
+   - The backend pushes the script to targets over SSH, so nothing may need installing on a
+     target host.
+   - The backend may use only its approved dependencies (see Backend); any new dependency needs
+     explicit approval.
 2. **Target is Ubuntu 24.04 LTS only** (CIS Ubuntu Linux 24.04 LTS Benchmark v2.0.0,
    dated 05-28-2026). Do not add logic for other distributions to the audit script
    (cross-distro is a documented gap, G6, not a feature of this script).
@@ -61,10 +129,15 @@ never parse the HTML.
    logic. Do not change a control's logic unless the PDF clearly disagrees, and show a diff
    summary before applying logic changes. See `VERIFICATION.md` for the current status.
 4. **Do not change the HTML report format** without being asked — it is a delivered artefact.
-5. The script runs as root on production-like hosts: audit checks must be **read-only**.
-   Never remediate, never write outside the chosen output paths.
-6. Keep `bash -n` clean; run `sudo bash cis_ubuntu_24.04_lts_v2.0.0_audit.sh --dry-run-safe`
-   (self-test: bash -n, shellcheck if installed, embedded-Python compile check) after edits.
+5. The script runs as root on production-like hosts, so its audit checks must be **read-only**.
+   It never remediates and never writes outside the chosen output paths.
+   - Remediation is a separate, opt-in platform feature that has not been built yet.
+   - It must never be bolted onto the audit script.
+6. Keep `bash -n` clean. After editing the script, run
+   `sudo bash cis_ubuntu_24.04_lts_v2.0.0_audit.sh --dry-run-safe`. That self-test runs `bash -n`,
+   shellcheck if installed, and a compile check of the embedded Python.
+7. **No AI features** anywhere in the platform.
+8. Only connect to hosts whose authorised use has been confirmed (see the Backend invariants).
 
 ## Research gaps addressed (G1–G8)
 
@@ -82,6 +155,7 @@ never parse the HTML.
 ## Files
 
 - `cis_ubuntu_24.04_lts_v2.0.0_audit.sh` — the audit script.
+- `backend/` — FastAPI platform backend (see `backend/README.md`).
 - `VERIFICATION.md` — script vs. CIS PDF verification (IDs, assessment types, logic differences).
 - `COUNTS.md` — authoritative control counts (total, Automated/Manual, per section).
 - CIS PDF: `CIS_Ubuntu_Linux_24.04_LTS_Benchmark_v2.0.0.pdf` (currently in the user's
